@@ -4,6 +4,40 @@ namespace LegacyRenewalApp
 {
     public class SubscriptionRenewalService
     {
+        private readonly IRenewalRequestValidator _validator;
+        private readonly IDiscountCalculator _discountCalculator;
+        private readonly IPaymentFeeCalculator _paymentFeeCalculator;
+        private readonly ITaxRateProvider _taxRateProvider;
+        private readonly IBillingGateway _billingGateway;
+        private readonly IInvoiceEmailService _invoiceEmailService;
+
+        public SubscriptionRenewalService()
+            : this(
+                new RenewalRequestValidator(),
+                new DiscountCalculator(),
+                new PaymentFeeCalculator(),
+                new TaxRateProvider(),
+                new LegacyBillingGatewayAdapter(),
+                new InvoiceEmailService(new LegacyBillingGatewayAdapter()))
+        {
+        }
+
+        public SubscriptionRenewalService(
+            IRenewalRequestValidator validator,
+            IDiscountCalculator discountCalculator,
+            IPaymentFeeCalculator paymentFeeCalculator,
+            ITaxRateProvider taxRateProvider,
+            IBillingGateway billingGateway,
+            IInvoiceEmailService invoiceEmailService)
+        {
+            _validator = validator;
+            _discountCalculator = discountCalculator;
+            _paymentFeeCalculator = paymentFeeCalculator;
+            _taxRateProvider = taxRateProvider;
+            _billingGateway = billingGateway;
+            _invoiceEmailService = invoiceEmailService;
+        }
+
         public RenewalInvoice CreateRenewalInvoice(
             int customerId,
             string planCode,
@@ -12,25 +46,7 @@ namespace LegacyRenewalApp
             bool includePremiumSupport,
             bool useLoyaltyPoints)
         {
-            if (customerId <= 0)
-            {
-                throw new ArgumentException("Customer id must be positive");
-            }
-
-            if (string.IsNullOrWhiteSpace(planCode))
-            {
-                throw new ArgumentException("Plan code is required");
-            }
-
-            if (seatCount <= 0)
-            {
-                throw new ArgumentException("Seat count must be positive");
-            }
-
-            if (string.IsNullOrWhiteSpace(paymentMethod))
-            {
-                throw new ArgumentException("Payment method is required");
-            }
+            _validator.Validate(customerId, planCode, seatCount, paymentMethod);
 
             string normalizedPlanCode = planCode.Trim().ToUpperInvariant();
             string normalizedPaymentMethod = paymentMethod.Trim().ToUpperInvariant();
@@ -47,134 +63,38 @@ namespace LegacyRenewalApp
             }
 
             decimal baseAmount = (plan.MonthlyPricePerSeat * seatCount * 12m) + plan.SetupFee;
-            decimal discountAmount = 0m;
-            string notes = string.Empty;
 
-            if (customer.Segment == "Silver")
-            {
-                discountAmount += baseAmount * 0.05m;
-                notes += "silver discount; ";
-            }
-            else if (customer.Segment == "Gold")
-            {
-                discountAmount += baseAmount * 0.10m;
-                notes += "gold discount; ";
-            }
-            else if (customer.Segment == "Platinum")
-            {
-                discountAmount += baseAmount * 0.15m;
-                notes += "platinum discount; ";
-            }
-            else if (customer.Segment == "Education" && plan.IsEducationEligible)
-            {
-                discountAmount += baseAmount * 0.20m;
-                notes += "education discount; ";
-            }
-
-            if (customer.YearsWithCompany >= 5)
-            {
-                discountAmount += baseAmount * 0.07m;
-                notes += "long-term loyalty discount; ";
-            }
-            else if (customer.YearsWithCompany >= 2)
-            {
-                discountAmount += baseAmount * 0.03m;
-                notes += "basic loyalty discount; ";
-            }
-
-            if (seatCount >= 50)
-            {
-                discountAmount += baseAmount * 0.12m;
-                notes += "large team discount; ";
-            }
-            else if (seatCount >= 20)
-            {
-                discountAmount += baseAmount * 0.08m;
-                notes += "medium team discount; ";
-            }
-            else if (seatCount >= 10)
-            {
-                discountAmount += baseAmount * 0.04m;
-                notes += "small team discount; ";
-            }
-
-            if (useLoyaltyPoints && customer.LoyaltyPoints > 0)
-            {
-                int pointsToUse = customer.LoyaltyPoints > 200 ? 200 : customer.LoyaltyPoints;
-                discountAmount += pointsToUse;
-                notes += $"loyalty points used: {pointsToUse}; ";
-            }
+            decimal discountAmount = _discountCalculator.Calculate(
+                customer,
+                plan,
+                baseAmount,
+                seatCount,
+                useLoyaltyPoints,
+                out string discountNotes);
 
             decimal subtotalAfterDiscount = baseAmount - discountAmount;
+            string notes = discountNotes;
+
             if (subtotalAfterDiscount < 300m)
             {
                 subtotalAfterDiscount = 300m;
                 notes += "minimum discounted subtotal applied; ";
             }
 
-            decimal supportFee = 0m;
+            decimal supportFee = CalculateSupportFee(includePremiumSupport, normalizedPlanCode);
             if (includePremiumSupport)
             {
-                if (normalizedPlanCode == "START")
-                {
-                    supportFee = 250m;
-                }
-                else if (normalizedPlanCode == "PRO")
-                {
-                    supportFee = 400m;
-                }
-                else if (normalizedPlanCode == "ENTERPRISE")
-                {
-                    supportFee = 700m;
-                }
-
                 notes += "premium support included; ";
             }
 
-            decimal paymentFee = 0m;
-            if (normalizedPaymentMethod == "CARD")
-            {
-                paymentFee = (subtotalAfterDiscount + supportFee) * 0.02m;
-                notes += "card payment fee; ";
-            }
-            else if (normalizedPaymentMethod == "BANK_TRANSFER")
-            {
-                paymentFee = (subtotalAfterDiscount + supportFee) * 0.01m;
-                notes += "bank transfer fee; ";
-            }
-            else if (normalizedPaymentMethod == "PAYPAL")
-            {
-                paymentFee = (subtotalAfterDiscount + supportFee) * 0.035m;
-                notes += "paypal fee; ";
-            }
-            else if (normalizedPaymentMethod == "INVOICE")
-            {
-                paymentFee = 0m;
-                notes += "invoice payment; ";
-            }
-            else
-            {
-                throw new ArgumentException("Unsupported payment method");
-            }
+            decimal paymentFee = _paymentFeeCalculator.Calculate(
+                normalizedPaymentMethod,
+                subtotalAfterDiscount + supportFee,
+                out string paymentFeeNote);
 
-            decimal taxRate = 0.20m;
-            if (customer.Country == "Poland")
-            {
-                taxRate = 0.23m;
-            }
-            else if (customer.Country == "Germany")
-            {
-                taxRate = 0.19m;
-            }
-            else if (customer.Country == "Czech Republic")
-            {
-                taxRate = 0.21m;
-            }
-            else if (customer.Country == "Norway")
-            {
-                taxRate = 0.25m;
-            }
+            notes += paymentFeeNote;
 
+            decimal taxRate = _taxRateProvider.GetTaxRate(customer.Country);
             decimal taxBase = subtotalAfterDiscount + supportFee + paymentFee;
             decimal taxAmount = taxBase * taxRate;
             decimal finalAmount = taxBase + taxAmount;
@@ -202,19 +122,35 @@ namespace LegacyRenewalApp
                 GeneratedAt = DateTime.UtcNow
             };
 
-            LegacyBillingGateway.SaveInvoice(invoice);
-
-            if (!string.IsNullOrWhiteSpace(customer.Email))
-            {
-                string subject = "Subscription renewal invoice";
-                string body =
-                    $"Hello {customer.FullName}, your renewal for plan {normalizedPlanCode} " +
-                    $"has been prepared. Final amount: {invoice.FinalAmount:F2}.";
-
-                LegacyBillingGateway.SendEmail(customer.Email, subject, body);
-            }
+            _billingGateway.SaveInvoice(invoice);
+            _invoiceEmailService.Send(customer, normalizedPlanCode, invoice);
 
             return invoice;
+        }
+
+        private static decimal CalculateSupportFee(bool includePremiumSupport, string normalizedPlanCode)
+        {
+            if (!includePremiumSupport)
+            {
+                return 0m;
+            }
+
+            if (normalizedPlanCode == "START")
+            {
+                return 250m;
+            }
+
+            if (normalizedPlanCode == "PRO")
+            {
+                return 400m;
+            }
+
+            if (normalizedPlanCode == "ENTERPRISE")
+            {
+                return 700m;
+            }
+
+            return 0m;
         }
     }
 }
